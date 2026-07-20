@@ -49,23 +49,43 @@ AI_SEMICONDUCTOR_MAP = {
 }
 
 # -------------------------------------------------------------
-# Rate Limit 방지 및 데이터 수집 함수
+# AttributeError 방지를 위한 데이터 정규화 함수
 # -------------------------------------------------------------
 @st.cache_data(ttl=3600, show_spinner=False)
 def get_stock_data(symbol, period="1y"):
     stock = yf.Ticker(symbol)
+    df = pd.DataFrame()
+    info = {}
+    
+    # 주가 데이터 수집 (재시도 로직)
     for attempt in range(3):
         try:
             df = stock.history(period=period)
-            info = stock.info
             if not df.empty:
-                return df, info
+                break
         except Exception as e:
             if "429" in str(e) or "Too Many Requests" in str(e):
                 time.sleep(2 ** attempt)
                 continue
             break
-    return pd.DataFrame(), {}
+            
+    # Info 데이터 안전 수집
+    try:
+        info = stock.info
+        if not isinstance(info, dict):
+            info = {}
+    except Exception:
+        info = {}
+
+    if not df.empty:
+        # MultiIndex 컬럼일 경우 첫 번째 레벨(Open, High, Low, Close 등)만 추출하여 평탄화
+        if isinstance(df.columns, pd.MultiIndex):
+            df.columns = df.columns.get_level_values(0)
+            
+        # 중복된 컬럼명이 생길 경우 첫 번째 컬럼만 유지하여 Series 보장
+        df = df.loc[:, ~df.columns.duplicated()]
+
+    return df, info
 
 # -------------------------------------------------------------
 # 사이드바 설정
@@ -82,7 +102,7 @@ available_stocks = AI_SEMICONDUCTOR_MAP[category]
 
 period = st.sidebar.selectbox("조회 기간", ["1mo", "3mo", "6mo", "1y", "2y", "5y"], index=3)
 
-# 레버리지 카테고리 선택 시 경고 안내
+# 레버리지 안내
 if "레버리지" in category:
     st.warning("⚠️ **레버리지 상품 주의사항:** 2배/3배 레버리지 상품은 일일 변동률을 추종하므로 횡보장이나 변동성 장세에서 **음의 이월 효과(Volatility Drag)**로 인해 장기 투자 시 손실이 커질 수 있습니다.")
 
@@ -96,49 +116,62 @@ if mode == "개별 종목/ETF 심층 분석":
     with st.spinner("데이터 요청 중..."):
         df, info = get_stock_data(ticker_symbol, period)
 
-    if df.empty:
-        st.error("데이터를 가져오는 중 문제가 발생했습니다. (Rate Limit 또는 티커 오류)")
+    if df.empty or "Close" not in df.columns:
+        st.error("데이터를 가져올 수 없거나 종목 데이터가 비어 있습니다. 잠시 후 다시 시도해주세요.")
     else:
-        latest_price = df["Close"].iloc[-1]
-        prev_price = df["Close"].iloc[-2] if len(df) > 1 else latest_price
-        change = latest_price - prev_price
-        pct_change = (change / prev_price) * 100
-        currency = info.get("currency", "USD")
+        try:
+            # Series 형태로 강력 변환 (AttributeError 완벽 방어)
+            close_series = pd.Series(df["Close"]).squeeze().dropna()
+            open_series = pd.Series(df["Open"]).squeeze()
+            high_series = pd.Series(df["High"]).squeeze()
+            low_series = pd.Series(df["Low"]).squeeze()
 
-        st.subheader(f"📌 {selected_stock_name}")
-        c1, c2, c3, c4 = st.columns(4)
-        c1.metric("현재가", f"{latest_price:,.2f} {currency}")
-        c2.metric("전일 대비", f"{change:+,.2f} {currency}", f"{pct_change:+.2f}%")
-        c3.metric("기간 최고가", f"{df['High'].max():,.2f} {currency}")
-        c4.metric("기간 최저가", f"{df['Low'].min():,.2f} {currency}")
+            if not close_series.empty:
+                latest_price = float(close_series.iloc[-1])
+                prev_price = float(close_series.iloc[-2]) if len(close_series) > 1 else latest_price
+                change = latest_price - prev_price
+                pct_change = (change / prev_price) * 100 if prev_price != 0 else 0
+                currency = info.get("currency", "USD") if info else "USD"
 
-        # 차트 생성
-        fig = go.Figure()
-        fig.add_trace(go.Candlestick(
-            x=df.index, open=df["Open"], high=df["High"],
-            low=df["Low"], close=df["Close"], name="OHLC"
-        ))
+                st.subheader(f"📌 {selected_stock_name}")
+                c1, c2, c3, c4 = st.columns(4)
+                c1.metric("현재가", f"{latest_price:,.2f} {currency}")
+                c2.metric("전일 대비", f"{change:+,.2f} {currency}", f"{pct_change:+.2f}%")
+                c3.metric("기간 최고가", f"{float(high_series.max()):,.2f} {currency}")
+                c4.metric("기간 최저가", f"{float(low_series.min()):,.2f} {currency}")
 
-        df["MA20"] = df["Close"].rolling(20).mean()
-        df["MA60"] = df["Close"].rolling(60).mean()
-        fig.add_trace(go.Scatter(x=df.index, y=df["MA20"], mode="lines", name="20일 이평선", line=dict(color="orange")))
-        fig.add_trace(go.Scatter(x=df.index, y=df["MA60"], mode="lines", name="60일 이평선", line=dict(color="green")))
+                # 캔들스틱 차트
+                fig = go.Figure()
+                fig.add_trace(go.Candlestick(
+                    x=df.index, open=open_series, high=high_series,
+                    low=low_series, close=close_series, name="OHLC"
+                ))
 
-        fig.update_layout(
-            title=f"{selected_stock_name} 차트",
-            yaxis_title=f"가격 ({currency})",
-            xaxis_rangeslider_visible=False,
-            height=500,
-            template="plotly_white"
-        )
-        st.plotly_chart(fig, use_container_width=True)
+                ma20 = close_series.rolling(20).mean()
+                ma60 = close_series.rolling(60).mean()
+                fig.add_trace(go.Scatter(x=df.index, y=ma20, mode="lines", name="20일 이평선", line=dict(color="orange")))
+                fig.add_trace(go.Scatter(x=df.index, y=ma60, mode="lines", name="60일 이평선", line=dict(color="green")))
 
-        # 개요
-        with st.expander("ℹ️ 종목/ETF 상세설명 보기"):
-            st.write(info.get("longBusinessSummary", "개요 정보가 없습니다."))
+                fig.update_layout(
+                    title=f"{selected_stock_name} 차트",
+                    yaxis_title=f"가격 ({currency})",
+                    xaxis_rangeslider_visible=False,
+                    height=500,
+                    template="plotly_white"
+                )
+                st.plotly_chart(fig, use_container_width=True)
+
+                # 개요
+                with st.expander("ℹ️ 종목/ETF 상세설명 보기"):
+                    summary = info.get("longBusinessSummary", "개요 정보를 가져올 수 없습니다.") if info else "개요 정보가 없습니다."
+                    st.write(summary)
+            else:
+                st.error("유효한 종가 데이터가 없습니다.")
+        except Exception as e:
+            st.error(f"차트 생성 중 오류가 발생했습니다: {e}")
 
 # -------------------------------------------------------------
-# MODE 2: 종목 간 수익률 비교 (레버리지 효과 확인)
+# MODE 2: 종목 간 수익률 비교
 # -------------------------------------------------------------
 else:
     st.subheader("📊 상대 수익률 (%) 비교 분석")
@@ -159,13 +192,15 @@ else:
             for name in selected_tickers:
                 symbol = available_stocks[name]
                 df, _ = get_stock_data(symbol, period)
-                if not df.empty:
-                    start_price = df["Close"].iloc[0]
-                    # 기준일 대비 수익률 계산 (%)
-                    combined_df[name] = ((df["Close"] - start_price) / start_price) * 100
+                if not df.empty and "Close" in df.columns:
+                    close_s = pd.Series(df["Close"]).squeeze().dropna()
+                    if not close_s.empty:
+                        start_price = float(close_s.iloc[0])
+                        if start_price != 0:
+                            combined_df[name] = ((close_s - start_price) / start_price) * 100
 
         if combined_df.empty:
-            st.error("데이터를 불러오지 못했습니다.")
+            st.error("선택한 종목들의 데이터를 불러오지 못했습니다.")
         else:
             fig_comp = px.line(
                 combined_df,
@@ -177,7 +212,6 @@ else:
             fig_comp.update_layout(height=550, template="plotly_white")
             st.plotly_chart(fig_comp, use_container_width=True)
 
-            # 기간 내 수익률 순위
             st.markdown("### 🏆 기간 내 최종 수익률 순위")
             final_returns = combined_df.iloc[-1].sort_values(ascending=False)
             ret_df = pd.DataFrame({"최종 누적 수익률 (%)": final_returns.map("{:+.2f}%".format)})
